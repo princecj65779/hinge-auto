@@ -77,6 +77,12 @@ def scroll_back_to_top(swipes: int | None = None) -> None:
 def do_skip() -> None:
     """Tap the X to advance to the next profile. Always taps (even in dry run);
     advancing is needed for the loop to see new profiles."""
+    # Tap the real Skip button found on screen, never a fixed coordinate:
+    # on a paywall a blind tap can hit a link and open Chrome.
+    if not vision.on_discover(adb.screenshot()):
+        print("Not on the Discover feed — recovering instead of tapping.")
+        adb.recover_to_hinge()
+        return
     x, y = config.COORDS["skip_button"]
     adb.tap(x, y)
     adb.jitter_sleep("after_skip")
@@ -98,8 +104,13 @@ def do_like(message: str = "") -> None:
     # a heart that's already low on screen (which it is after capture),
     # Send Like ends up off-screen and undetectable. Worth the ~14s.
     scroll_back_to_top()
-    heart_xy = vision.find_first_heart(adb.screenshot())
-    if heart_xy is None:
+    # A compose box can be left open from an earlier failed attempt; it
+    # replaces photo 1's heart. If Send Like is already showing, use it.
+    already_open = vision.find_send_like(adb.screenshot())
+    heart_xy = None if already_open else vision.find_first_heart(adb.screenshot())
+    if already_open:
+        print("Compose box already open — reusing it.")
+    elif heart_xy is None:
         # Static fallback used to fire here, but it silently misses on
         # profiles where the heart's real position differs from the
         # calibrated coord (different layouts, partial scroll-back). The
@@ -107,10 +118,19 @@ def do_like(message: str = "") -> None:
         # producing an infinite-loop on the same profile. Bail to skip
         # instead so the profile advances and the loop survives.
         raise RuntimeError("vision: couldn't find photo-1 heart after scroll-back")
-    adb.tap(*heart_xy)
-    adb.jitter_sleep("after_tap")
+    if heart_xy is not None:
+        adb.tap(*heart_xy)
+        adb.jitter_sleep("after_tap")
 
     send_xy = vision.find_send_like(adb.screenshot())
+    # The compose box opens below the tapped heart; on some layouts it ends
+    # up below the screen edge. Nudge the page up a little and look again.
+    for _ in range(2):
+        if send_xy is not None:
+            break
+        adb.swipe(540, 1600, 540, 1200, 400)
+        time.sleep(1.5)
+        send_xy = vision.find_send_like(adb.screenshot())
     if send_xy is None:
         # Same reasoning as the heart fallback above — silent fallback
         # masks a real failure and traps the loop. Skip instead.
@@ -205,7 +225,59 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "advance to the next city in the rotation. Loops back to "
              "start when exhausted.",
     )
+    p.add_argument(
+        "--manual",
+        action="store_true",
+        help="Manual mode: judge and suggest an opener (copied to the "
+             "clipboard) but never tap. You like/paste/send or skip in the "
+             "emulator yourself, then press Enter for the next profile.",
+    )
     return p.parse_args(argv)
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    try:
+        import subprocess
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        return True
+    except Exception:
+        return False
+
+
+def _manual_handoff(decision, likes_sent: int, skips: int) -> tuple[int, int, bool]:
+    """Show the suggestion and wait for the user to act in the emulator.
+    Returns (likes_sent, skips, stop)."""
+    print()
+    if decision.decision == "like":
+        if decision.message:
+            copied = _copy_to_clipboard(decision.message)
+            print(f">>> SUGGEST: LIKE. Opener {'copied to clipboard' if copied else '(copy it yourself)'}:")
+            print(f"    {decision.message}")
+        else:
+            print(">>> SUGGEST: LIKE (no opener; send a plain like or write your own)")
+        print("    In the emulator: tap the heart, paste with Cmd+V, edit if you want, tap Send Like.")
+        prompt = "    [Enter] done, I liked  ·  [s] I skipped  ·  [q] quit > "
+    else:
+        print(">>> SUGGEST: SKIP. Tap the X in the emulator (or like her yourself).")
+        prompt = "    [Enter] done, I skipped  ·  [l] I liked  ·  [q] quit > "
+    try:
+        choice = input(prompt).strip().lower()
+    except EOFError:
+        choice = "q"
+    if choice == "q":
+        try:
+            sure = input("    Quit manual mode? (y/n) > ").strip().lower()
+        except EOFError:
+            sure = "y"
+        if sure == "y":
+            return likes_sent, skips, True
+        return _manual_handoff(decision, likes_sent, skips)
+    liked = (decision.decision == "like" and choice != "s") or choice == "l"
+    if liked:
+        likes_sent += 1
+    else:
+        skips += 1
+    return likes_sent, skips, False
 
 
 def main() -> int:
@@ -224,7 +296,10 @@ def main() -> int:
         else "no age gate"
     )
     print(f"Mode:     {config.MODE_NAME} ({age_band})")
-    print(f"Run:      {'DRY RUN (no taps)' if config.DRY_RUN else 'LIVE (will tap)'}")
+    if args.manual:
+        print("Run:      MANUAL (suggests only — you tap, paste, and send)")
+    else:
+        print(f"Run:      {'DRY RUN (no taps)' if config.DRY_RUN else 'LIVE (will tap)'}")
     print(f"Max likes: {config.MAX_LIKES_PER_SESSION}, "
           f"max profiles: {config.MAX_PROFILES_PER_SESSION}")
 
@@ -265,8 +340,33 @@ def main() -> int:
     total_seconds = 0.0
     last_frame0_hash: str | None = None
     duplicate_streak = 0
+    not_profile_streak = 0
 
     while profiles_seen < config.MAX_PROFILES_PER_SESSION:
+        # Guard: if a tap opened another app (e.g. a Hinge+ paywall link
+        # launching Chrome), press Back instead of capturing/judging it.
+        if adb.foreground_package() != "co.hinge.app":
+            not_profile_streak += 1
+            print(f"Hinge is not in front (streak {not_profile_streak}) — pressing Back.")
+            if not_profile_streak >= 3:
+                print("\nStuck outside Hinge — halting. Reopen Hinge on Discover and rerun.")
+                break
+            adb.recover_to_hinge()
+            continue
+
+        # Guard: no "Skip <name>" button means this isn't a Discover profile
+        # (Hinge+ paywall, popup). Press Back before scrolling or judging.
+        if not vision.on_discover(adb.screenshot()):
+            not_profile_streak += 1
+            print(f"No profile on screen (paywall/popup?) — closing it "
+                  f"(streak {not_profile_streak}).")
+            if not_profile_streak >= 3:
+                print("\nCan't get back to a profile — halting. Close the popup "
+                      "in the emulator, open Discover, and rerun.")
+                break
+            adb.recover_to_hinge()
+            continue
+
         profiles_seen += 1
         print(f"\n--- Profile {profiles_seen} ---")
 
@@ -308,6 +408,10 @@ def main() -> int:
         # which silently breaks duplicate detection. Cropping isolates the
         # part of the screen that actually identifies the profile.
         frame0_hash = _profile_region_hash(frames[0])
+        if args.manual and frame0_hash == last_frame0_hash:
+            input("Same profile still showing. Like or skip her in the "
+                  "emulator, then press Enter... ")
+            continue
         if frame0_hash == last_frame0_hash:
             duplicate_streak += 1
             print(f"DUPLICATE: frame 0 matches previous profile "
@@ -357,6 +461,21 @@ def main() -> int:
             do_skip()
             continue
 
+        # Guard: the judge couldn't find a real profile (paywall, popup,
+        # help page). Don't tap Skip blindly on it; press Back and halt
+        # if it keeps happening.
+        if (decision.name or "").strip().lower() in ("", "unknown") and decision.decision == "skip":
+            not_profile_streak += 1
+            print(f"Not a profile ({decision.reasoning[:80]}...) — pressing Back "
+                  f"(streak {not_profile_streak}).")
+            if not_profile_streak >= 3:
+                print("\nKept landing on non-profile screens — halting. Check the emulator.")
+                break
+            adb.recover_to_hinge()
+            last_frame0_hash = None
+            continue
+        not_profile_streak = 0
+
         print(f"Name:     {decision.name}")
         print(f"Decision: {decision.decision} ({decision.confidence}) "
               f"[{decision.skip_reason if decision.decision == 'skip' else decision.message_archetype}]")
@@ -364,6 +483,19 @@ def main() -> int:
         if decision.message:
             print(f"Message:  {decision.message}")
         save_debug(frames, decision, profiles_seen)
+
+        if args.manual:
+            likes_sent, skips, stop = _manual_handoff(decision, likes_sent, skips)
+            metrics.log_profile(profiles_seen, decision, {})
+            total_cost += metrics.estimated_cost(decision.usage)
+            metrics.print_running_totals(
+                profiles_seen, likes_sent, skips, total_cost, 0.0,
+            )
+            if stop:
+                break
+            # Give Hinge a moment to load the next profile after your action.
+            time.sleep(2)
+            continue
 
         t2 = time.monotonic()
         if decision.decision == "like":
@@ -373,6 +505,10 @@ def main() -> int:
             try:
                 do_like(decision.message)
                 likes_sent += 1
+                if likes_sent >= config.MAX_LIKES_PER_SESSION:
+                    print(f"Sent {likes_sent} likes — reached max likes cap. Stopping.")
+                    metrics.log_profile(profiles_seen, decision, {})
+                    break
             except Exception as e:
                 print(f"do_like failed: {e!r} — recovering by skipping this profile.")
                 try:

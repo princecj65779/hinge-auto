@@ -77,7 +77,22 @@ def find_first_heart(png: bytes) -> tuple[int, int] | None:
         regions; the heart's white circle is ~10800-11000 px
     """
     arr = _png_to_array(png)
-    mask = (arr[..., 0] > 235) & (arr[..., 1] > 235) & (arr[..., 2] > 235)
+    r, g, b = (arr[..., i].astype(int) for i in range(3))
+    white = (r > 235) & (g > 235) & (b > 235)
+    # Current Hinge (2026) draws the heart in a dark #1a1a1a circle instead
+    # of a white one; same size and position. Accept either.
+    dark = (r < 45) & (g < 45) & (b < 45) & (abs(r - g) < 8) & (abs(g - b) < 8)
+    hearts = []
+    for mask in (white, dark):
+        hearts += _heart_blobs(mask)
+    if not hearts:
+        return None
+    hearts.sort()
+    cy, cx = hearts[0]
+    return (cx, cy)
+
+
+def _heart_blobs(mask) -> list[tuple[int, int]]:
     labeled, _ = label(mask)
     hearts = []
     for i, sl in enumerate(find_objects(labeled), 1):
@@ -98,11 +113,7 @@ def find_first_heart(png: bytes) -> tuple[int, int] | None:
             continue
         cy = (y0 + y1) // 2
         hearts.append((cy, cx))
-    if not hearts:
-        return None
-    hearts.sort()
-    cy, cx = hearts[0]
-    return (cx, cy)
+    return hearts
 
 
 def comment_field_text_pixels(png: bytes, send_like_xy: tuple[int, int]) -> int:
@@ -135,3 +146,17 @@ def find_comment_input(send_like_xy: tuple[int, int]) -> tuple[int, int]:
     """
     _, send_y = send_like_xy
     return (540, send_y - 171)
+
+
+def on_discover(png: bytes) -> bool:
+    """True if the screen is Hinge's main feed (dark bottom nav bar present).
+
+    The Hinge+ paywall, help pages and Chrome have a light bottom area, so
+    this tells "safe to tap Skip" apart from "a popup is covering the feed".
+    Measured on a 1080x2424 Pixel 10: nav bar rows are solid #1a1a1a.
+    """
+    a = _png_to_array(png)
+    h = a.shape[0]
+    rows = [int(h * r) for r in (0.915, 0.925, 0.965, 0.975)]
+    dark = [(a[y, :, :3].astype(int).sum(axis=1) < 150).mean() for y in rows]
+    return min(dark) > 0.9

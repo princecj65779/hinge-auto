@@ -28,6 +28,33 @@ def check_device() -> str:
     return lines[0].split("\t")[0]
 
 
+def foreground_package() -> str:
+    """Return the package name of the app currently in front ("" if unknown)."""
+    out = _run(["shell", "dumpsys", "activity", "activities"], capture=True).decode(errors="ignore")
+    for line in out.splitlines():
+        if "topResumedActivity" in line or "mResumedActivity" in line:
+            for tok in line.split():
+                if "/" in tok:
+                    return tok.split("/")[0]
+    return ""
+
+
+def recover_to_hinge() -> None:
+    """Get off a popup / other app: press Back, and if that left Hinge
+    (home screen, Chrome), relaunch Hinge. Never taps on the popup itself,
+    so it can't hit a purchase button or a link."""
+    press_back()
+    time.sleep(3)
+    if foreground_package() != "co.hinge.app":
+        _run(["shell", "monkey", "-p", "co.hinge.app", "-c",
+              "android.intent.category.LAUNCHER", "1"], capture=True)
+        time.sleep(6)
+
+
+def press_back() -> None:
+    _run(["shell", "input", "keyevent", "KEYCODE_BACK"])
+
+
 def screenshot() -> bytes:
     """Return PNG bytes of the current screen."""
     return _run(["exec-out", "screencap", "-p"], capture=True)

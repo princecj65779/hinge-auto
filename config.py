@@ -14,7 +14,7 @@ from pathlib import Path
 
 # ---------- Mode selection ----------
 # Which `modes/<name>.py` to load. Overridden per-run by `python main.py --mode X`.
-ACTIVE_MODE = "example_lenient"
+ACTIVE_MODE = "witty"
 
 # These get filled in by _apply_mode() at the bottom of this file. Declared
 # here so static analyzers / IDEs see them. Do not edit by hand — edit the
